@@ -1,86 +1,125 @@
-1. What is Double-Double Precision?
+# Double-Double Precision Arithmetic
 
-A double-double number is a software-emulated floating-point type that extends the precision of a standard IEEE-754 double (64-bit, ~53 bits of mantissa ≈ 16 decimal digits) by representing one logical number as the unevaluated sum of two doubles:
+## 1. What Is Double-Double Precision?
 
-x = x_\text{hi} + x_\text{lo}, \quad |x_\text{lo}| \leq \tfrac{1}{2} \, \text{ulp}(x_\text{hi})
-	•	hi holds the main value (nearest double).
-	•	lo carries the round-off error or residual.
-	•	Together, they give ~106 bits of mantissa (~31–32 decimal digits).
+A **double-double number** is a software-emulated floating-point type that extends the precision of a standard IEEE-754 double (64-bit, ~53 bits of mantissa ≈ 16 decimal digits) by representing one logical number as the unevaluated sum of two doubles:
 
-This is not a new IEEE format; it’s a trick relying on careful use of standard double arithmetic.
+$$
+x = x_{hi} + x_{lo}, \quad |x_{lo}| \le \tfrac{1}{2} \, \mathrm{ulp}(x_{hi})
+$$
 
-⸻
+- **`hi`** holds the main value (nearest double).  
+- **`lo`** carries the round-off error or residual.  
+- Together, they give roughly **106 bits of mantissa (~31–32 decimal digits)**.
 
-2. Core Tools: Error-Free Transforms
+This is *not* a new IEEE format — it’s a software trick relying on carefully ordered standard double arithmetic.
 
-The whole scheme relies on algorithms that decompose floating-point results into exact parts.
-	•	TwoSum(a, b) → (s, e)
-Computes sum s = a + b and error e such that
-a + b = s + e \quad \text{exactly.}
-	•	TwoProd(a, b) → (p, e)
-Computes product p = a·b and error e such that
-a \cdot b = p + e \quad \text{exactly.}
-(relies on fused multiply-add (FMA) when available for speed/accuracy).
+---
 
-These guarantee error-free transformations within IEEE double, critical for DD arithmetic.
+## 2. Core Tools: Error-Free Transforms
 
-⸻
+The entire scheme depends on algorithms that decompose floating-point operations into exact parts.
 
-3. Double-Double Addition
+### TwoSum
+Computes the exact sum of two doubles:
 
-Given two DD numbers x = (x_h, x_l), y = (y_h, y_l):
-	1.	(s, e) = TwoSum(x_h, y_h)
-— Add the high parts, capture residual.
-	2.	t = x_l + y_l
-— Add the low parts.
-	3.	(s2, e2) = TwoSum(s, t)
-— Fold in low parts.
-	4.	Result:
-z_h = s2, \quad z_l = e + e2
+$$
+(a + b) = s + e \quad \text{exactly.}
+$$
 
-After a possible renormalization step (making sure |z_l| < ulp(z_h)), this gives ~106 bits of precision.
+### TwoProd
+Computes the exact product of two doubles (using FMA if available):
 
-⸻
+$$
+(a \cdot b) = p + e \quad \text{exactly.}
+$$
 
-4. Double-Double Multiplication
+These **error-free transforms** guarantee correctness within IEEE-754 double precision — essential for stable double-double arithmetic.
 
-Given two DD numbers x = (x_h, x_l), y = (y_h, y_l):
-	1.	(p, e) = TwoProd(x_h, y_h)
-— Main product and its rounding error.
-	2.	p1 = p
-— Start with main product.
-	3.	p2 = (x_h * y_l) + (x_l * y_h)
-— Cross terms (each smaller).
-	4.	Sum them carefully:
-(s, e2) = TwoSum(p1, p2)
-	5.	Accumulate all errors:
-lo = e + e2 + (x_l * y_l)
-	6.	Renormalize:
-(hi, lo2) = TwoSum(s, lo)
+---
+
+## 3. Double-Double Addition
+
+Given two double-double numbers  
+\( x = (x_h, x_l) \), \( y = (y_h, y_l) \):
+
+1. \( (s, e) = \text{TwoSum}(x_h, y_h) \)  
+   Add high parts, capture residual.  
+2. \( t = x_l + y_l \)  
+   Add low parts.  
+3. \( (s_2, e_2) = \text{TwoSum}(s, t) \)  
+   Fold in the low parts.  
+4. Result:
+
+$$
+z_h = s_2, \quad z_l = e + e_2
+$$
+
+After a brief **renormalization** step (ensuring \( |z_l| < \mathrm{ulp}(z_h) \)), this yields ~106-bit precision.
+
+---
+
+## 4. Double-Double Multiplication
+
+Given \( x = (x_h, x_l) \), \( y = (y_h, y_l) \):
+
+1. \( (p, e) = \text{TwoProd}(x_h, y_h) \)  
+   Main product and rounding error.  
+2. \( p_1 = p \)  
+   Start with the main product.  
+3. \( p_2 = (x_h \cdot y_l) + (x_l \cdot y_h) \)  
+   Cross terms.  
+4. \( (s, e_2) = \text{TwoSum}(p_1, p_2) \)  
+   Combine partial results.  
+5. Accumulate small terms:
+
+$$
+\text{lo} = e + e_2 + (x_l \cdot y_l)
+$$
+
+6. Renormalize:
+
+$$
+(\text{hi}, \text{lo}_2) = \text{TwoSum}(s, \text{lo})
+$$
 
 Final result:
-z_h = hi, \quad z_l = lo2
 
-This achieves double-double precision multiplication with error bounded to about one ulp of the 106-bit result.
+$$
+z_h = \text{hi}, \quad z_l = \text{lo}_2
+$$
 
-⸻
+This achieves full **double-double precision multiplication**, with error bounded to about one ulp of the 106-bit result.
 
-5. Why It Works
-	•	IEEE-754 double has guard digits and FMA that let you recover round-off exactly.
-	•	By keeping the small remainder (lo) separate, you retain ~53 + 53 = 106 bits.
-	•	DD math is significantly slower (≈ 10–20× a plain double multiply), but much faster than arbitrary-precision libraries.
+---
 
-⸻
+## 5. Why It Works
 
-6. Other Operations
-	•	Division: Compute hi = x_h / y_h, refine via Newton iteration with DD multiply.
-	•	Square root: Similar, use initial double guess, refine with Newton.
-	•	Normalization: After every op, adjust so that hi is the rounded double and lo is the small correction.
+- IEEE-754 doubles include guard digits and FMA, enabling recovery of round-off errors exactly.  
+- Keeping the small remainder separately yields roughly \( 53 + 53 = 106 \) bits of precision.  
+- Performance: about **10–20× slower** than native double operations, but still **much faster** than arbitrary-precision libraries.
 
-⸻
+---
 
-7. Applications
-	•	Fractal zooming (Mandelbrot/Julia)
-	•	High-precision geometry kernels
-	•	Numerical analysis (compensated algorithms)
-	•	Validating IEEE quad-precision implementations
+## 6. Other Operations
+
+- **Division:** Compute \( \text{hi} = x_h / y_h \), then refine via Newton iteration using DD multiply.  
+- **Square root:** Use a double-precision initial guess, refine with Newton’s method.  
+- **Normalization:** After each operation, ensure `hi` is the rounded double and `lo` is the small correction.
+
+---
+
+## 7. Applications
+
+- Deep-zoom fractal rendering (Mandelbrot / Julia).  
+- High-precision geometry kernels.  
+- Numerical analysis and compensated algorithms.  
+- Validation of IEEE quad-precision implementations.
+
+---
+
+### References
+
+- Dekker, T. J. (1971). *A Floating-Point Technique for Extending the Available Precision.*  
+- Knuth, D. E. (1997). *The Art of Computer Programming, Vol. 2: Seminumerical Algorithms.*  
+- Bailey, D. H. (2001). *High-Precision Floating-Point Arithmetic in Scientific Computation.*
