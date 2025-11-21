@@ -1,6 +1,6 @@
 # Double-Double Precision Math
 
-High-precision floating-point and complex arithmetic for **Mandelbrot Metal**, implemented using **double-double (DD)** arithmetic in pure Swift.
+High-precision floating-point and complex arithmetic as used in **Mandelbrot Metal**, and implemented using **double-double (DD)** arithmetic in pure Swift.
 
 This module provides:
 
