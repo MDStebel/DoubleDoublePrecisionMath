@@ -1,236 +1,344 @@
+//  DoubleDoublePrecisionMath.swift
+//  Mandelbrot Metal
 //
-//  DoubleDouble.swift
-//  MandelbrotMetal
+//  Created by Michael Stebel on 8/8/25.
+//  Updated on 11/21/25.
 //
-//  Created by Michael Stebel on 9/8/25.
-//
-//  Double-double (≈106-bit) arithmetic for CPU-side Swift.
-//  Representation: x = hi + lo, with |lo| <= 0.5 ulp(hi)
-//
-//  Notes / Safety against regressions:
-//  - We *must* use fma() to get error-free product residuals in TwoProd.
-//  - Do not rewrite `fma(a,b,c)` as `(a*b)+c`; that breaks error accounting.
-//  - The renormalization step ensures |lo| is small relative to hi.
-//  - Subnormals: keep denormals enabled on CPU; flushing may lose a bit of robustness.
-//  - Build with at least -O; inlining hints included.
 
 import Foundation
-import simd
 
-@frozen
-public struct DD: Sendable, Equatable {
-    @usableFromInline var v: simd_double2   // v.x = hi, v.y = lo
+// MARK: - Double-Double Arithmetic for High-Precision Computing
 
-    @inlinable public var hi: Double { v.x }
-    @inlinable public var lo: Double { v.y }
-
-    // MARK: - Inits
-    @inlinable public init(_ hi: Double, _ lo: Double) {
-        self.v = simd_double2(hi, lo)
-        self = DD.renorm(self) // ensure canonical form
+/// A double-double precision floating-point number representation.
+///
+/// Represents a high-precision real value as the unevaluated sum of two
+/// `Double` values: `x ≈ hi + lo`, where `hi` holds the leading bits and
+/// `lo` holds the trailing error term.
+///
+/// This gives ~106 bits of precision (~31–32 decimal digits), which is
+/// useful for extreme zoom levels in Mandelbrot Metal where FP64 is not
+/// sufficient.
+internal struct DD {
+    /// Leading (high) part of the value.
+    var hi: Double
+    /// Trailing (low) part, storing the rounding error of `hi`.
+    var lo: Double
+    
+    /// Initializes a `DD` from a regular `Double`, treating it as exact
+    /// (all bits go into `hi`, and `lo` is set to zero).
+    @inline(__always)
+    init(_ x: Double = 0.0) {
+        self.hi = x
+        self.lo = 0.0
     }
-
-    @inlinable public init(_ x: Double) {
-        self.v = simd_double2(x, 0.0)
-    }
-
-    // MARK: - Constants
-    public static let zero = DD(0.0)
-    public static let one  = DD(1.0)
-    public static let two  = DD(2.0)
-
-    // MARK: - Core error-free transforms
-
-    /// Knuth/Dekker TwoSum: returns s,e with a+b = s+e exactly (assuming RN)
-    @inlinable @inline(__always)
-    static func twoSum(_ a: Double, _ b: Double) -> (s: Double, e: Double) {
-        let s = a + b
-        // Recover roundoff: (s - a) cancels high bits of s leaving contribution of b
-        let bb = s - a
-        let e = (a - (s - bb)) + (b - bb)
-        return (s, e)
-    }
-
-    /// FastTwoSum when |a| >= |b| (slightly faster); caller must ensure precondition.
-    @inlinable @inline(__always)
-    static func fastTwoSum(_ a: Double, _ b: Double) -> (s: Double, e: Double) {
-        let s = a + b
-        let e = b - (s - a)
-        return (s, e)
-    }
-
-    /// Error-free product: p = a*b (rounded), e = exact residual so that a*b = p + e
-    @inlinable @inline(__always)
-    static func twoProd(_ a: Double, _ b: Double) -> (p: Double, e: Double) {
-        let p = a * b
-        // FMA gives exact (a*b - p) in one rounded step
-        let e = fma(a, b, -p)
-        return (p, e)
-    }
-
-    // MARK: - Renormalization
-
-    /// Normalize (hi, lo) so that hi is the rounded sum and |lo| <= 0.5 ulp(hi)
-    @inlinable @inline(__always)
-    static func renorm(_ x: DD) -> DD {
-        // Prefer fastTwoSum if |hi| >= |lo|; otherwise fall back to general twoSum.
-        if abs(x.hi) >= abs(x.lo) {
-            let (h, l) = fastTwoSum(x.hi, x.lo)
-            return DD.unchecked(h, l)
-        } else {
-            let (h, l) = twoSum(x.hi, x.lo)
-            return DD.unchecked(h, l)
-        }
-    }
-
-    /// Construct without renormalization (internal use).
-    @inlinable @inline(__always)
-    static func unchecked(_ hi: Double, _ lo: Double) -> DD {
-        var r = DD(0.0)
-        r.v = simd_double2(hi, lo)
-        return r
-    }
-
-    // MARK: - Basic ops
-
-    /// x + y (double-double)
-    @inlinable @inline(__always)
-    public static func + (x: DD, y: DD) -> DD {
-        // Add high parts, capture residual
-        let (s, e) = twoSum(x.hi, y.hi)
-        // Add low parts, fold in carefully
-        let t = x.lo + y.lo
-        let (s2, e2) = twoSum(s, t)
-        // Combine all errors
-        let z = unchecked(s2, e + e2)
-        return renorm(z)
-    }
-
-    /// x - y
-    @inlinable @inline(__always)
-    public static func - (x: DD, y: DD) -> DD {
-        return x + (-y)
-    }
-
-    /// Unary minus
-    @inlinable @inline(__always)
-    public static prefix func - (x: DD) -> DD {
-        return unchecked(-x.hi, -x.lo)
-    }
-
-    /// x * y (double-double)
-    @inlinable @inline(__always)
-    public static func * (x: DD, y: DD) -> DD {
-        // Main product and its rounding error
-        let (p, pe) = twoProd(x.hi, y.hi)
-
-        // Cross terms (smaller in magnitude)
-        let c = x.hi * y.lo + x.lo * y.hi
-
-        // Accumulate main + cross with error tracking
-        let (s, e2) = twoSum(p, c)
-
-        // Add all small pieces: product residual + cross residual + lo*lo
-        let loAll = pe + e2 + (x.lo * y.lo)
-
-        // Final renormalization
-        let (hi2, lo2) = twoSum(s, loAll)
-        return renorm(unchecked(hi2, lo2))
-    }
-
-    /// Square (slightly cheaper than x*x)
-    @inlinable @inline(__always)
-    public func squared() -> DD {
-        // (hi + lo)^2 = hi^2 + 2*hi*lo + lo^2
-        let (p, pe) = DD.twoProd(self.hi, self.hi)
-        let cross = 2.0 * self.hi * self.lo
-        let (s, e2) = DD.twoSum(p, cross)
-        let loAll = pe + e2 + (self.lo * self.lo)
-        let (hi2, lo2) = DD.twoSum(s, loAll)
-        return DD.renorm(DD.unchecked(hi2, lo2))
-    }
-
-    /// x / y using one Newton refinement (good to ~106 bits)
-    @inlinable @inline(__always)
-    public static func / (x: DD, y: DD) -> DD {
-        // Initial double quotient
-        let q0 = x.hi / y.hi
-
-        // r = x - y*q0 (DD-accurate)
-        let r = x - (y * DD(q0))
-
-        // Correction term ≈ (r.hi + r.lo)/y.hi (double is fine; then fold in)
-        let corr = (r.hi + r.lo) / y.hi
-
-        // q = q0 + corr, normalize
-        let q = DD(q0, 0.0) + DD(corr, 0.0)
-        return renorm(q)
-    }
-
-    // MARK: - Mixed ops
-
-    @inlinable @inline(__always)
-    public static func + (x: DD, a: Double) -> DD {
-        let (s, e) = twoSum(x.hi, a)
-        let (hi2, lo2) = twoSum(s, x.lo + e)
-        return renorm(unchecked(hi2, lo2))
-    }
-
-    @inlinable @inline(__always)
-    public static func - (x: DD, a: Double) -> DD { x + (-a) }
-
-    @inlinable @inline(__always)
-    public static func * (x: DD, a: Double) -> DD {
-        let (p, pe) = twoProd(x.hi, a)
-        let loAll = pe + x.lo * a
-        let (hi2, lo2) = twoSum(p, loAll)
-        return renorm(unchecked(hi2, lo2))
-    }
-
-    @inlinable @inline(__always)
-    public static func / (x: DD, a: Double) -> DD {
-        // Note: this is safe since ‘a’ is a double; we normalize result
-        let q0 = x.hi / a
-        // r = x - a*q0
-        let r = x - DD(q0) * a
-        let corr = (r.hi + r.lo) / a
-        return renorm(DD(q0) + DD(corr))
-    }
-
-    // MARK: - Utilities
-
-    /// ulp of the high part (for diagnostics)
-    @inlinable public var ulpHi: Double { Double.ulpOfOne * abs(hi) }
-
-    /// Convert back to Double (rounded)
-    @inlinable public var asDouble: Double { hi + lo }
-
-    /// Exact-ish string (for debugging / logging)
-    public var description: String {
-        // Compact, avoids scientific unless large/small
-        return String(format: "DD(hi=%0.17g, lo=%0.17g)", hi, lo)
+    
+    /// Initializes a `DD` from explicit high and low components.
+    /// Use this when you already have a compensated representation.
+    @inline(__always)
+    init(hi: Double, lo: Double) {
+        self.hi = hi
+        self.lo = lo
     }
 }
 
-// MARK: - Quick self-checks (leave in Debug builds)
-#if DEBUG
-@usableFromInline
-func __dd_self_test() {
-    // Addition vs. plain double
-    let a = DD(1.0e16) + DD(1.0)   // standard double would lose the +1 here
-    assert(a.asDouble - 1.0e16 == 1.0, "DD add lost low bit")
+// MARK: - Low-Level Error-Free Transformations
 
-    // Multiplication sanity
-    let x = DD(1.234567890123456)  // ~53-bit payload
-    let y = DD(9.876543210987654)
-    let z = x * y
-    let ref = x.asDouble * y.asDouble
-    // DD should be within a handful of double ulps of the *true* 106-bit product projection
-    precondition(abs(z.asDouble - ref) <= max(1.0, abs(ref)) * 1e-30, "DD mul suspicious")
-
-    // Division round-trip
-    let q = z / y
-    let err = abs((q.asDouble - x.asDouble) / x.asDouble)
-    precondition(err < 1e-30, "DD div too imprecise")
+/// Computes the exact sum of two `Double` values, returning both the
+/// rounded sum and the rounding error.
+///
+/// This is Knuth's *two-sum* algorithm, an error-free transformation:
+///   - `s` is the correctly rounded sum `a + b` in `Double`.
+///   - `e` is the residual such that `a + b = s + e` exactly.
+///
+/// This forms the foundation of double-double addition and normalization.
+@inline(__always)
+internal func twoSum(_ a: Double, _ b: Double) -> (Double, Double) {
+    let s  = a + b
+    let bb = s - a
+    let e  = (a - (s - bb)) + (b - bb)
+    return (s, e)
 }
-#endif
+
+/// A faster variant of `twoSum` used when we know that `|a| >= |b|`.
+///
+/// This is the standard *quick-two-sum* algorithm:
+///   - `s` is the correctly rounded sum `a + b`.
+///   - `e` is the small residual such that `a + b = s + e` exactly.
+///
+/// Precondition: `abs(a) >= abs(b)` must hold for the error formula to
+/// be stable. In this file we only use `quickTwoSum` in contexts where
+/// `a` is the large leading term and `b` is a small correction.
+@inline(__always)
+internal func quickTwoSum(_ a: Double, _ b: Double) -> (Double, Double) {
+    let s = a + b
+    let e = b - (s - a)
+    return (s, e)
+}
+
+/// Computes the exact product of two `Double` values, returning both the
+/// rounded product and the rounding error.
+///
+/// On Apple silicon, `fma(a, b, -p)` gives the exact residual of
+/// `a * b - p` in one rounded step, so:
+///   - `p` is the correctly rounded product `a * b`.
+///   - `e` is the residual such that `a * b = p + e` exactly.
+@inline(__always)
+internal func twoProd(_ a: Double, _ b: Double) -> (Double, Double) {
+    let p = a * b
+    let e = fma(a, b, -p) // exact residual on Apple silicon
+    return (p, e)
+}
+
+// MARK: - Double-Double Operations
+
+/// Adds two double-double numbers with extended precision.
+///
+/// We:
+///  1. Use `twoSum` on the high parts to obtain a rounded sum `s` and
+///     an error term `e1`.
+///  2. Fold in both low parts and `e1` to form a small correction `e2`.
+///  3. Use `quickTwoSum(s, e2)` to normalize back into `(hi, lo)`.
+///
+/// This is a standard, numerically stable pattern for DD addition.
+@inline(__always)
+internal func ddAdd(_ x: DD, _ y: DD) -> DD {
+    // Sum leading parts and track the rounding error.
+    let (s, e1)  = twoSum(x.hi, y.hi)
+    
+    // Accumulate lower parts plus the error from the high-part sum.
+    let e2       = e1 + x.lo + y.lo
+    
+    // Normalize so that hi holds the leading bits and lo the small tail.
+    let (hi, lo) = quickTwoSum(s, e2)
+    return DD(hi: hi, lo: lo)
+}
+
+/// Multiplies two double-double numbers with extended precision.
+///
+/// We:
+///  1. Use `twoProd` on the high parts to obtain `p ≈ x.hi * y.hi` and
+///     its error `e1`.
+///  2. Add the cross terms `x.hi * y.lo + x.lo * y.hi` into `e2`.
+///  3. Use `twoSum(p, e1 + e2)` to normalize the result into `(hi, lo)`.
+///
+/// This yields a full double-double product with ~106 bits of precision,
+/// suitable for extreme Mandelbrot iterations.
+@inline(__always)
+internal func ddMul(_ x: DD, _ y: DD) -> DD {
+    // Product of high parts plus its error term.
+    let (p, e1)  = twoProd(x.hi, y.hi)
+    
+    // Cross terms (the low*low term is small enough to ignore here).
+    let e2       = x.hi * y.lo + x.lo * y.hi
+    
+    // Normalize the accumulated product.
+    let (hi, lo) = twoSum(p, e1 + e2)
+    return DD(hi: hi, lo: lo)
+}
+
+/// Subtracts two double-double numbers with extended precision.
+///
+/// Implemented in terms of `ddAdd` by negating both components of `y`.
+/// The optimizer typically eliminates the temporary `DD` in hot paths.
+@inline(__always)
+internal func ddSub(_ x: DD, _ y: DD) -> DD {
+    ddAdd(x, DD(hi: -y.hi, lo: -y.lo))
+}
+
+// MARK: - DD Convenience Operators & Helpers
+
+extension DD {
+    // MARK: Basic arithmetic operators (DD × DD)
+    /// Adds two `DD` values using `ddAdd`.
+    @inline(__always)
+    static func + (lhs: DD, rhs: DD) -> DD {
+        ddAdd(lhs, rhs)
+    }
+
+    /// Subtracts two `DD` values using `ddSub`.
+    @inline(__always)
+    static func - (lhs: DD, rhs: DD) -> DD {
+        ddSub(lhs, rhs)
+    }
+
+    /// Multiplies two `DD` values using `ddMul`.
+    @inline(__always)
+    static func * (lhs: DD, rhs: DD) -> DD {
+        ddMul(lhs, rhs)
+    }
+
+    // MARK: Mixed arithmetic with `Double`
+    /// Adds a `Double` to a `DD` by promoting the `Double` to `DD`.
+    @inline(__always)
+    static func + (lhs: DD, rhs: Double) -> DD {
+        ddAdd(lhs, DD(rhs))
+    }
+
+    /// Adds a `DD` to a `Double` by promoting the `Double` to `DD`.
+    @inline(__always)
+    static func + (lhs: Double, rhs: DD) -> DD {
+        ddAdd(DD(lhs), rhs)
+    }
+
+    /// Subtracts a `Double` from a `DD` by promoting the `Double` to `DD`.
+    @inline(__always)
+    static func - (lhs: DD, rhs: Double) -> DD {
+        ddSub(lhs, DD(rhs))
+    }
+
+    /// Subtracts a `DD` from a `Double` by promoting the `Double` to `DD`.
+    @inline(__always)
+    static func - (lhs: Double, rhs: DD) -> DD {
+        ddSub(DD(lhs), rhs)
+    }
+
+    /// Multiplies a `DD` by a `Double` by promoting the `Double` to `DD`.
+    @inline(__always)
+    static func * (lhs: DD, rhs: Double) -> DD {
+        ddMul(lhs, DD(rhs))
+    }
+
+    /// Multiplies a `Double` by a `DD` by promoting the `Double` to `DD`.
+    @inline(__always)
+    static func * (lhs: Double, rhs: DD) -> DD {
+        ddMul(DD(lhs), rhs)
+    }
+
+    // MARK: Compound assignment operators
+    /// Compound-adds a `DD` to this value.
+    @inline(__always)
+    static func += (lhs: inout DD, rhs: DD) {
+        lhs = ddAdd(lhs, rhs)
+    }
+
+    /// Compound-subtracts a `DD` from this value.
+    @inline(__always)
+    static func -= (lhs: inout DD, rhs: DD) {
+        lhs = ddSub(lhs, rhs)
+    }
+
+    /// Compound-multiplies this value by a `DD`.
+    @inline(__always)
+    static func *= (lhs: inout DD, rhs: DD) {
+        lhs = ddMul(lhs, rhs)
+    }
+}
+
+/// Squares a double-double number (`x * x`) with extended precision.
+///
+/// This is a small convenience wrapper around `ddMul(x, x)` used
+/// frequently in inner loops (e.g., Mandelbrot iteration).
+@inline(__always)
+internal func ddSquare(_ x: DD) -> DD {
+    ddMul(x, x)
+}
+
+// MARK: - Complex Double-Double Type for Mandelbrot
+
+/// A complex number with double-double real and imaginary parts.
+///
+/// This is tailored for Mandelbrot Metal's deep-zoom kernel, where
+/// both the real and imaginary components need ~106 bits of precision.
+internal struct DDComplex {
+    /// Real part of the complex value.
+    var re: DD
+    /// Imaginary part of the complex value.
+    var im: DD
+
+    /// Initializes a complex value from `DD` components.
+    @inline(__always)
+    init(re: DD = DD(), im: DD = DD()) {
+        self.re = re
+        self.im = im
+    }
+
+    /// Initializes a complex value from `Double` components, promoted to `DD`.
+    @inline(__always)
+    init(re: Double, im: Double) {
+        self.re = DD(re)
+        self.im = DD(im)
+    }
+}
+
+// MARK: Complex Arithmetic Helpers
+
+/// Adds two `DDComplex` numbers component-wise.
+@inline(__always)
+internal func ddComplexAdd(_ z1: DDComplex, _ z2: DDComplex) -> DDComplex {
+    DDComplex(re: ddAdd(z1.re, z2.re),
+              im: ddAdd(z1.im, z2.im))
+}
+
+/// Subtracts two `DDComplex` numbers component-wise.
+@inline(__always)
+internal func ddComplexSub(_ z1: DDComplex, _ z2: DDComplex) -> DDComplex {
+    DDComplex(re: ddSub(z1.re, z2.re),
+              im: ddSub(z1.im, z2.im))
+}
+
+/// Multiplies two `DDComplex` numbers with full double-double precision.
+///
+/// (a + bi) * (c + di) = (ac - bd) + (ad + bc)i
+@inline(__always)
+internal func ddComplexMul(_ z1: DDComplex, _ z2: DDComplex) -> DDComplex {
+    let ac = ddMul(z1.re, z2.re)
+    let bd = ddMul(z1.im, z2.im)
+    let ad = ddMul(z1.re, z2.im)
+    let bc = ddMul(z1.im, z2.re)
+
+    let real = ddSub(ac, bd)
+    let imag = ddAdd(ad, bc)
+
+    return DDComplex(re: real, im: imag)
+}
+
+/// Returns |z|^2 for a complex double-double number.
+///
+/// This is often used in Mandelbrot iteration to test bailout
+/// without needing a true square root.
+@inline(__always)
+internal func ddComplexAbsSquared(_ z: DDComplex) -> DD {
+    let re2 = ddMul(z.re, z.re)
+    let im2 = ddMul(z.im, z.im)
+    return ddAdd(re2, im2)
+}
+
+// MARK: DDComplex Operator overloads
+
+extension DDComplex {
+    /// Adds two complex double-double values using `ddComplexAdd`.
+    @inline(__always)
+    static func + (lhs: DDComplex, rhs: DDComplex) -> DDComplex {
+        ddComplexAdd(lhs, rhs)
+    }
+
+    /// Subtracts two complex double-double values using `ddComplexSub`.
+    @inline(__always)
+    static func - (lhs: DDComplex, rhs: DDComplex) -> DDComplex {
+        ddComplexSub(lhs, rhs)
+    }
+
+    /// Multiplies two complex double-double values using `ddComplexMul`.
+    @inline(__always)
+    static func * (lhs: DDComplex, rhs: DDComplex) -> DDComplex {
+        ddComplexMul(lhs, rhs)
+    }
+
+    /// Compound-adds another complex value.
+    @inline(__always)
+    static func += (lhs: inout DDComplex, rhs: DDComplex) {
+        lhs = ddComplexAdd(lhs, rhs)
+    }
+
+    /// Compound-subtracts another complex value.
+    @inline(__always)
+    static func -= (lhs: inout DDComplex, rhs: DDComplex) {
+        lhs = ddComplexSub(lhs, rhs)
+    }
+
+    /// Compound-multiplies by another complex value.
+    @inline(__always)
+    static func *= (lhs: inout DDComplex, rhs: DDComplex) {
+        lhs = ddComplexMul(lhs, rhs)
+    }
+}
