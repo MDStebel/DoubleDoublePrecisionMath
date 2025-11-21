@@ -1,5 +1,5 @@
 //  DoubleDoublePrecisionMath.swift
-//  Mandelbrot Metal
+//  As I originally wrote for my Mandelbrot Metal app.
 //
 //  Created by Michael Stebel on 8/8/25.
 //  Updated on 11/21/25.
@@ -18,6 +18,7 @@ import Foundation
 /// This gives ~106 bits of precision (~31–32 decimal digits), which is
 /// useful for extreme zoom levels in Mandelbrot Metal where FP64 is not
 /// sufficient.
+@frozen 
 internal struct DD {
     /// Leading (high) part of the value.
     var hi: Double
