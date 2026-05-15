@@ -2,7 +2,7 @@
 //  Mandelbrot Metal
 //
 //  Created by Michael Stebel on 8/8/25.
-//  Updated by Michael on 11/21/25.
+//  Updated on 5/15/25.
 //
 
 import Foundation
@@ -18,7 +18,7 @@ import Foundation
 /// This gives ~106 bits of precision (~31–32 decimal digits), which is
 /// useful for extreme zoom levels in Mandelbrot Metal where FP64 is not
 /// sufficient.
-internal struct DD {
+internal struct DD: Equatable, CustomStringConvertible {
     /// Leading (high) part of the value.
     var hi: Double
     /// Trailing (low) part, storing the rounding error of `hi`.
@@ -39,21 +39,31 @@ internal struct DD {
         self.hi = hi
         self.lo = lo
     }
+
+    /// Debug-friendly representation that keeps both components visible.
+    var description: String {
+        "DD(hi: \(hi), lo: \(lo))"
+    }
 }
 
 // MARK: - Low-Level Error-Free Transformations
 
-/// Computes the exact sum of two `Double` values, returning both the
-/// rounded sum and the rounding error.
+/// Computes the exact sum of two finite `Double` values when the rounded sum
+/// is finite, returning both the rounded sum and the rounding error.
 ///
 /// This is Knuth's *two-sum* algorithm, an error-free transformation:
 ///   - `s` is the correctly rounded sum `a + b` in `Double`.
 ///   - `e` is the residual such that `a + b = s + e` exactly.
 ///
+/// Non-finite or overflowing sums return a zero residual instead of attempting
+/// an error transform on infinities.
+///
 /// This forms the foundation of double-double addition and normalization.
 @inline(__always)
 internal func twoSum(_ a: Double, _ b: Double) -> (Double, Double) {
     let s  = a + b
+    guard s.isFinite else { return (s, 0.0) }
+
     let bb = s - a
     let e  = (a - (s - bb)) + (b - bb)
     return (s, e)
@@ -65,28 +75,48 @@ internal func twoSum(_ a: Double, _ b: Double) -> (Double, Double) {
 ///   - `s` is the correctly rounded sum `a + b`.
 ///   - `e` is the small residual such that `a + b = s + e` exactly.
 ///
+/// Non-finite or overflowing sums return a zero residual instead of attempting
+/// an error transform on infinities.
+///
 /// Precondition: `abs(a) >= abs(b)` must hold for the error formula to
 /// be stable. In this file we only use `quickTwoSum` in contexts where
 /// `a` is the large leading term and `b` is a small correction.
 @inline(__always)
 internal func quickTwoSum(_ a: Double, _ b: Double) -> (Double, Double) {
     let s = a + b
+    guard s.isFinite else { return (s, 0.0) }
+
     let e = b - (s - a)
     return (s, e)
 }
 
-/// Computes the exact product of two `Double` values, returning both the
-/// rounded product and the rounding error.
+/// Computes the exact product of two finite `Double` values when the rounded
+/// product is finite, returning both the rounded product and the rounding error.
 ///
-/// On Apple silicon, `fma(a, b, -p)` gives the exact residual of
-/// `a * b - p` in one rounded step, so:
+/// When the rounded product is finite, `fma(a, b, -p)` gives the residual
+/// of `a * b - p` in one rounded step, so:
 ///   - `p` is the correctly rounded product `a * b`.
 ///   - `e` is the residual such that `a * b = p + e` exactly.
+///
+/// Non-finite or overflowing products return a zero residual instead of
+/// producing a NaN from `fma(a, b, -p)`.
 @inline(__always)
 internal func twoProd(_ a: Double, _ b: Double) -> (Double, Double) {
     let p = a * b
-    let e = fma(a, b, -p) // exact residual on Apple silicon
+    guard p.isFinite else { return (p, 0.0) }
+
+    let e = fma(a, b, -p)
     return (p, e)
+}
+
+/// Normalizes a high/low pair into a canonical double-double value.
+///
+/// Unlike `quickTwoSum`, this does not assume the high component already
+/// dominates the low component, which keeps cancellation-heavy results safe.
+@inline(__always)
+internal func ddRenormalize(_ hi: Double, _ lo: Double) -> DD {
+    let (normalizedHi, normalizedLo) = twoSum(hi, lo)
+    return DD(hi: normalizedHi, lo: normalizedLo)
 }
 
 // MARK: - Double-Double Operations
@@ -96,21 +126,25 @@ internal func twoProd(_ a: Double, _ b: Double) -> (Double, Double) {
 /// We:
 ///  1. Use `twoSum` on the high parts to obtain a rounded sum `s` and
 ///     an error term `e1`.
-///  2. Fold in both low parts and `e1` to form a small correction `e2`.
-///  3. Use `quickTwoSum(s, e2)` to normalize back into `(hi, lo)`.
+///  2. Use `twoSum` on the low parts so their own residual is not discarded.
+///  3. Fold the high- and low-part residuals together.
+///  4. Renormalize without relying on `quickTwoSum`'s magnitude precondition.
 ///
-/// This is a standard, numerically stable pattern for DD addition.
+/// This is a slightly more conservative DD addition than the common fast
+/// "sloppy add" pattern, which helps when the high parts nearly cancel.
 @inline(__always)
 internal func ddAdd(_ x: DD, _ y: DD) -> DD {
     // Sum leading parts and track the rounding error.
-    let (s, e1)  = twoSum(x.hi, y.hi)
+    let (s, e1) = twoSum(x.hi, y.hi)
     
-    // Accumulate lower parts plus the error from the high-part sum.
-    let e2       = e1 + x.lo + y.lo
+    // Sum lower parts separately so their residual can still contribute.
+    let (t, e2) = twoSum(x.lo, y.lo)
     
-    // Normalize so that hi holds the leading bits and lo the small tail.
-    let (hi, lo) = quickTwoSum(s, e2)
-    return DD(hi: hi, lo: lo)
+    // Fold the high-part residual and low-part sum together before the final
+    // two-step normalization.
+    let (correction, e3) = twoSum(e1, t)
+    let partial = ddRenormalize(s, correction)
+    return ddRenormalize(partial.hi, partial.lo + e2 + e3)
 }
 
 /// Multiplies two double-double numbers with extended precision.
@@ -119,7 +153,7 @@ internal func ddAdd(_ x: DD, _ y: DD) -> DD {
 ///  1. Use `twoProd` on the high parts to obtain `p ≈ x.hi * y.hi` and
 ///     its error `e1`.
 ///  2. Add the cross terms `x.hi * y.lo + x.lo * y.hi` into `e2`.
-///  3. Use `twoSum(p, e1 + e2)` to normalize the result into `(hi, lo)`.
+///  3. Renormalize `p + e1 + e2` into `(hi, lo)`.
 ///
 /// This yields a full double-double product with ~106 bits of precision,
 /// suitable for extreme Mandelbrot iterations.
@@ -132,8 +166,7 @@ internal func ddMul(_ x: DD, _ y: DD) -> DD {
     let e2       = x.hi * y.lo + x.lo * y.hi
     
     // Normalize the accumulated product.
-    let (hi, lo) = twoSum(p, e1 + e2)
-    return DD(hi: hi, lo: lo)
+    return ddRenormalize(p, e1 + e2)
 }
 
 /// Subtracts two double-double numbers with extended precision.
@@ -239,7 +272,7 @@ internal func ddSquare(_ x: DD) -> DD {
 ///
 /// This is tailored for Mandelbrot Metal's deep-zoom kernel, where
 /// both the real and imaginary components need ~106 bits of precision.
-internal struct DDComplex {
+internal struct DDComplex: Equatable, CustomStringConvertible {
     /// Real part of the complex value.
     var re: DD
     /// Imaginary part of the complex value.
@@ -257,6 +290,11 @@ internal struct DDComplex {
     init(re: Double, im: Double) {
         self.re = DD(re)
         self.im = DD(im)
+    }
+
+    /// Debug-friendly representation that keeps both DD components visible.
+    var description: String {
+        "DDComplex(re: \(re), im: \(im))"
     }
 }
 
