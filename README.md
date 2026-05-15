@@ -1,17 +1,18 @@
 # Double-Double Precision Math
 
-High-precision floating-point and complex arithmetic as used in **Mandelbrot Metal**, and implemented using **double-double (DD)** arithmetic in pure Swift.
+High-precision floating-point and complex arithmetic for **Mandelbrot Metal**, implemented using **double-double (DD)** arithmetic in pure Swift.
 
 This module provides:
 
 - `DD`: a high-precision real type (~106 bits, ~31–32 decimal digits)
 - `DDComplex`: a complex number type using `DD` for real + imaginary parts
 - Exact error-free transforms (`twoSum`, `quickTwoSum`, `twoProd`)
+- DD renormalization (`ddRenormalize`)
 - High-precision operations (`ddAdd`, `ddSub`, `ddMul`, `ddSquare`)
 - Complex arithmetic (`ddComplexAdd`, `ddComplexMul`, etc.)
 - Operator overloads for natural mathematical syntax
 
-These operations power Mandelbrot Metal’s **CPU Deep Mode** when zooming past the precision limits of standard 64-bit floating-point.
+These operations power Mandelbrot Metal's **CPU Deep Mode** when zooming past the precision limits of standard 64-bit floating-point. CPU Deep Mode is currently focused on Mandelbrot Set exploration; Julia Set rendering uses the GPU path while sharing the app's palette, SSAA, lighting, capture, and bookmark controls.
 
 ---
 
@@ -31,7 +32,7 @@ Together they yield ~106 bits of precision — roughly **twice** the precision o
 ### Type Definition
 
 ```swift
-internal struct DD {
+internal struct DD: Equatable, CustomStringConvertible {
     var hi: Double
     var lo: Double
 }
@@ -50,7 +51,8 @@ DD(hi: x, lo: y)
 
 ### 2.1 `twoSum(a, b)`
 
-Computes an **exact sum** using Knuth’s algorithm:
+Computes an **exact sum** for finite, non-overflowing inputs using Knuth’s
+algorithm:
 
 ```swift
 let (s, e) = twoSum(a, b)
@@ -66,7 +68,17 @@ A faster version of `twoSum` when `|a| >= |b|`.
 
 ### 2.3 `twoProd(a, b)`
 
-Computes an **exact product** using fused-multiply-add.
+Computes an **exact product** using fused-multiply-add when the rounded
+product is finite. Overflow and other non-finite products return a zero tail
+instead of producing a NaN residual.
+
+---
+
+### 2.4 `ddRenormalize(hi, lo)`
+
+Normalizes a high/low pair using `twoSum`, without requiring the high
+component to dominate the low component. This is used after cancellation-heavy
+operations where `quickTwoSum`'s precondition may not hold.
 
 ---
 
@@ -74,7 +86,10 @@ Computes an **exact product** using fused-multiply-add.
 
 ### 3.1 `ddAdd(x, y)`
 
-High-precision addition using `twoSum` + `quickTwoSum`.
+High-precision addition using separate `twoSum` passes for the high and low
+components, followed by conservative renormalization. This is a little more
+defensive than the common fast "sloppy add" pattern and behaves better when
+the high components nearly cancel.
 
 ### 3.2 `ddMul(x, y)`
 
@@ -82,7 +97,7 @@ High-precision multiplication using:
 
 - `twoProd`
 - Cross terms
-- Final normalization
+- Final `ddRenormalize`
 
 ### 3.3 `ddSub(x, y)`
 
@@ -109,7 +124,7 @@ Double mixed arithmetic
 ## 5. Complex Double-Double: `DDComplex`
 
 ```swift
-internal struct DDComplex {
+internal struct DDComplex: Equatable, CustomStringConvertible {
     var re: DD
     var im: DD
 }
@@ -153,6 +168,15 @@ func mandelbrotIterationsDD(...) -> Int {
 }
 ```
 
+### Julia Mode Note
+
+The same `z = z * z + c` recurrence is used for Julia sets, but the roles differ:
+
+- Mandelbrot Set: `z` starts at `0`, and each pixel supplies `c`.
+- Julia Set: each pixel supplies the starting `z`, and the renderer uses a fixed Julia constant.
+
+This README documents the double-double primitives used by the Mandelbrot deep path. If CPU deep rendering is later extended to Julia mode, the same `DD` and `DDComplex` types can represent the Julia starting point and fixed constant.
+
 ---
 
 ## 9. Performance Notes
@@ -161,6 +185,7 @@ func mandelbrotIterationsDD(...) -> Int {
 - No heap allocation
 - `twoProd` uses hardware FMA
 - Optimized for deep fractal zooming
+- Current CPU deep-render integration is Mandelbrot-focused; Julia mode remains GPU-rendered.
 
 ---
 
@@ -170,11 +195,11 @@ func mandelbrotIterationsDD(...) -> Int {
 - Reciprocal
 - Trigonometric functions
 - Additional utilities
+- Julia-specific CPU deep-render integration
 
 ---
 
 ## 11. License
 
 Part of **Mandelbrot Metal**  
-© 2025 Michael Stebel. All rights reserved.
-
+© 2025-2026 Michael Stebel. All rights reserved.
